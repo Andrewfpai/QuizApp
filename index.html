@@ -128,7 +128,6 @@
   .paste textarea:focus { border-color: var(--accent); }
   .paste .row { margin-top: 10px; }
   .err { color: var(--bad); font-size: 13.5px; margin-right: auto; white-space: pre-line; }
-  .note { color: var(--muted); font-size: 13.5px; margin-right: auto; }
 
   /* library */
   .library { margin-top: 44px; }
@@ -247,7 +246,7 @@
   .field { display: flex; flex-direction: column; gap: 6px; margin-top: 14px; font-size: 13px; color: var(--muted); }
   .field input { padding: 11px 13px; border-radius: 10px; border: 1px solid var(--border); background: var(--bg); outline: none; font-size: 15px; color: var(--text); }
   .field input:focus { border-color: var(--accent); }
-  form .err, form .note { margin-top: 12px; }
+  form .err { margin-top: 12px; }
   .acct-row { display: flex; justify-content: space-between; align-items: center; gap: 12px; padding: 11px 0; border-bottom: 1px solid var(--border); font-size: 14px; }
   .acct-row b { font-weight: 600; overflow: hidden; text-overflow: ellipsis; }
   .acct-row .dot { margin-right: 6px; }
@@ -359,12 +358,22 @@ const allQuizzes = () => live('quiz').map(r => ({ id: r.id, ...r.data })).sort((
 const attemptsOf = qid => live('attempt').filter(r => r.data.quizId === qid).map(r => ({ id: r.id, ...r.data })).sort((a, b) => a.at - b.at);
 const pendingCount = () => Object.values(store.records).filter(r => r.dirty).length;
 
-/* ---------- cloud sync (Supabase) ---------- */
+/* ---------- cloud sync (Firebase Auth + Firestore, through their REST APIs) ----------
+   Each record is a Firestore document at users/{uid}/items/{id}. The security rules only accept a
+   change whose updatedAt is newer than the stored one, and stamp syncedAt with the server time,
+   which is what devices pull by. */
 const CFG = window.RECALL_CONFIG || {};
-const CLOUD_URL = (CFG.supabaseUrl || '').trim().replace(/\/+$/, '');
-const CLOUD_KEY = (CFG.supabaseAnonKey || '').trim();
-const cloudOn = !!(CLOUD_URL && CLOUD_KEY);
-const AUTH_KEY = 'recall.auth';
+const API_KEY = (CFG.firebaseApiKey || '').trim();
+const PROJECT = (CFG.firebaseProjectId || '').trim();
+const cloudOn = !!(API_KEY && PROJECT);
+const HOSTS = { // `hosts` in config.js is only for testing against a local stand-in
+  auth: 'https://identitytoolkit.googleapis.com',
+  token: 'https://securetoken.googleapis.com',
+  firestore: 'https://firestore.googleapis.com',
+  ...CFG.hosts,
+};
+const DOCS = `projects/${PROJECT}/databases/(default)/documents`;
+const AUTH_KEY = 'recall.firebase-auth';
 let auth = (() => { try { return JSON.parse(localStorage.getItem(AUTH_KEY)); } catch { return null; } })();
 let syncStatus = 'idle', syncError = '', syncTimer = null, syncing = null, syncAgain = false, refreshing = null;
 
@@ -373,21 +382,37 @@ function setAuth(a) {
   try { a ? localStorage.setItem(AUTH_KEY, JSON.stringify(a)) : localStorage.removeItem(AUTH_KEY); } catch {}
   renderStatus();
 }
-const sessionFrom = j => ({
-  access_token: j.access_token, refresh_token: j.refresh_token,
-  expires_at: Math.floor(Date.now() / 1000) + (j.expires_in || 3600),
-  user: { id: j.user?.id, email: j.user?.email },
+// Sign-in and token-refresh responses use different field names
+const sessionFrom = (j, email) => ({
+  token: j.idToken || j.id_token,
+  refresh: j.refreshToken || j.refresh_token,
+  expiresAt: Math.floor(Date.now() / 1000) + Number(j.expiresIn || j.expires_in || 3600),
+  user: { id: j.localId || j.user_id, email: j.email || email },
 });
 
-async function cloudFetch(path, { method = 'GET', body, token } = {}) {
-  const headers = { apikey: CLOUD_KEY, 'Content-Type': 'application/json' };
+const AUTH_ERRORS = {
+  EMAIL_EXISTS: 'An account with this email already exists. Sign in instead.',
+  INVALID_LOGIN_CREDENTIALS: 'Wrong email or password.',
+  INVALID_PASSWORD: 'Wrong email or password.',
+  EMAIL_NOT_FOUND: 'Wrong email or password.',
+  INVALID_EMAIL: 'That email address isn’t valid.',
+  WEAK_PASSWORD: 'Use a password with at least 6 characters.',
+  TOO_MANY_ATTEMPTS_TRY_LATER: 'Too many attempts. Try again in a few minutes.',
+  USER_DISABLED: 'This account has been disabled.',
+  OPERATION_NOT_ALLOWED: 'Email sign-in isn’t turned on in Firebase yet (see SETUP.md).',
+  ADMIN_ONLY_OPERATION: 'New sign-ups are turned off for this app.',
+};
+
+async function cloudFetch(url, { method = 'GET', body, form, token } = {}) {
+  const headers = { 'Content-Type': form ? 'application/x-www-form-urlencoded' : 'application/json' };
   if (token) headers.Authorization = 'Bearer ' + token;
-  const res = await fetch(CLOUD_URL + path, { method, headers, body: body === undefined ? undefined : JSON.stringify(body) });
+  const res = await fetch(url, { method, headers, body: form ? new URLSearchParams(form) : body === undefined ? undefined : JSON.stringify(body) });
   const text = await res.text();
   let json = null;
   try { json = text ? JSON.parse(text) : null; } catch {}
   if (!res.ok) {
-    const err = new Error(json?.msg || json?.error_description || json?.message || json?.error || `Request failed (${res.status})`);
+    const msg = String((Array.isArray(json) ? json[0] : json)?.error?.message || `Request failed (${res.status})`);
+    const err = new Error(AUTH_ERRORS[msg.split(' ')[0]] || msg);
     err.status = res.status;
     throw err;
   }
@@ -396,38 +421,65 @@ async function cloudFetch(path, { method = 'GET', body, token } = {}) {
 
 async function accessToken() {
   if (!auth) throw Object.assign(new Error('Not signed in'), { status: 401 });
-  if (auth.expires_at - 60 > Date.now() / 1000) return auth.access_token;
-  refreshing ||= cloudFetch('/auth/v1/token?grant_type=refresh_token', { method: 'POST', body: { refresh_token: auth.refresh_token } })
-    .then(j => setAuth(sessionFrom(j)))
+  if (auth.expiresAt - 60 > Date.now() / 1000) return auth.token;
+  refreshing ||= cloudFetch(`${HOSTS.token}/v1/token?key=${API_KEY}`, { method: 'POST', form: { grant_type: 'refresh_token', refresh_token: auth.refresh } })
+    .then(j => setAuth(sessionFrom(j, auth?.user.email)))
     .catch(err => { if (err.status >= 400 && err.status < 500) setAuth(null); throw err; }) // network errors keep you signed in
     .finally(() => { refreshing = null; });
   await refreshing;
-  return auth.access_token;
+  return auth.token;
 }
-async function api(path, opts = {}) {
-  try { return await cloudFetch(path, { ...opts, token: await accessToken() }); }
+async function api(url, opts = {}) {
+  try { return await cloudFetch(url, { ...opts, token: await accessToken() }); }
   catch (err) {
     if (err.status !== 401 || !auth) throw err;
-    auth.expires_at = 0; // token rejected: refresh once and retry
-    return cloudFetch(path, { ...opts, token: await accessToken() });
+    auth.expiresAt = 0; // token rejected: refresh once and retry
+    return cloudFetch(url, { ...opts, token: await accessToken() });
   }
 }
 
 async function signIn(email, password, create) {
-  const j = await cloudFetch(create ? '/auth/v1/signup' : '/auth/v1/token?grant_type=password', { method: 'POST', body: { email, password } });
-  if (!j?.access_token) return false; // account made, but the project requires email confirmation first
+  const j = await cloudFetch(`${HOSTS.auth}/v1/accounts:${create ? 'signUp' : 'signInWithPassword'}?key=${API_KEY}`,
+    { method: 'POST', body: { email, password, returnSecureToken: true } });
   store.cursor = null;
   saveStore();
   setAuth(sessionFrom(j));
   sync();
-  return true;
 }
 function signOut() {
-  const t = auth?.access_token;
   store.cursor = null;
   saveStore();
   setAuth(null);
-  if (t) cloudFetch('/auth/v1/logout', { method: 'POST', token: t }).catch(() => {});
+}
+
+const toWrite = r => ({
+  update: {
+    name: `${DOCS}/users/${auth.user.id}/items/${r.id}`,
+    fields: {
+      kind: { stringValue: r.kind },
+      data: r.data == null ? { nullValue: null } : { stringValue: JSON.stringify(r.data) },
+      updatedAt: { integerValue: String(r.updatedAt) },
+      deleted: { booleanValue: !!r.deleted },
+    },
+  },
+  updateTransforms: [{ fieldPath: 'syncedAt', setToServerValue: 'REQUEST_TIME' }],
+});
+const fromDoc = d => ({
+  id: d.name.split('/').pop(),
+  kind: d.fields.kind.stringValue,
+  data: d.fields.data?.stringValue ? JSON.parse(d.fields.data.stringValue) : null,
+  updated_at: Number(d.fields.updatedAt.integerValue),
+  deleted: !!d.fields.deleted?.booleanValue,
+});
+function pullQuery(since, after) {
+  const q = {
+    from: [{ collectionId: 'items' }],
+    orderBy: [{ field: { fieldPath: 'syncedAt' }, direction: 'ASCENDING' }, { field: { fieldPath: '__name__' }, direction: 'ASCENDING' }],
+    limit: 500,
+  };
+  if (since) q.where = { fieldFilter: { field: { fieldPath: 'syncedAt' }, op: 'GREATER_THAN', value: { timestampValue: since } } };
+  if (after) q.startAt = { values: [{ timestampValue: after.ts }, { referenceValue: after.name }], before: false };
+  return { structuredQuery: q };
 }
 
 function scheduleSync(ms = 800) {
@@ -443,26 +495,32 @@ async function sync() {
   syncing = (async () => {
     setSync('syncing');
     try {
-      // 1. push local changes; the server keeps whichever version has the newer updatedAt
+      // 1. push local changes; each write succeeds or fails on its own
       const sent = Object.values(store.records).filter(r => r.dirty).map(r => ({ ...r }));
-      if (sent.length) {
-        await api('/rest/v1/rpc/push_items', { method: 'POST', body: {
-          items: sent.map(r => ({ id: r.id, kind: r.kind, data: r.data, updated_at: r.updatedAt, deleted: r.deleted })),
-        } });
-        for (const s of sent) { const cur = store.records[s.id]; if (cur && cur.updatedAt === s.updatedAt) cur.dirty = false; }
+      for (let i = 0; i < sent.length; i += 400) {
+        const chunk = sent.slice(i, i + 400);
+        const res = await api(`${HOSTS.firestore}/v1/${DOCS}:batchWrite`, { method: 'POST', body: { writes: chunk.map(toWrite) } });
+        chunk.forEach((s, k) => {
+          // 0 = saved; 7 = refused because the server already has a newer version, which the pull below fetches
+          const code = res?.status?.[k]?.code || 0, cur = store.records[s.id];
+          if ((code === 0 || code === 7) && cur && cur.updatedAt === s.updatedAt) cur.dirty = false;
+        });
         saveStore();
       }
-      // 2. pull everything changed on the server since the last pull
-      let changed = false, cursor = store.cursor, first = true;
+      // 2. pull everything changed on the server since the last pull. Look back a few seconds
+      //    so writes that committed late aren't missed; re-reading a record is harmless.
+      let changed = false, cursor = store.cursor, after = null;
+      const since = cursor ? new Date(Date.parse(cursor.replace(/(\.\d{3})\d+/, '$1')) - 10000).toISOString() : null;
       for (;;) {
-        // look back a few seconds on the first page so writes that committed late aren't missed
-        const since = cursor && first ? new Date(Date.parse(cursor.replace(/(\.\d{3})\d+/, '$1')) - 10000).toISOString() : cursor;
-        const rows = await api(`/rest/v1/items?select=id,kind,data,updated_at,deleted,synced_at&user_id=eq.${auth.user.id}`
-          + `&order=synced_at.asc&limit=1000${since ? '&synced_at=gt.' + encodeURIComponent(since) : ''}`);
-        for (const row of rows) changed = mergeRow(row) || changed;
-        if (rows.length) cursor = rows[rows.length - 1].synced_at;
-        first = false;
-        if (rows.length < 1000) break;
+        const res = await api(`${HOSTS.firestore}/v1/${DOCS}/users/${auth.user.id}:runQuery`, { method: 'POST', body: pullQuery(since, after) });
+        const docs = (res || []).filter(x => x.document).map(x => x.document);
+        for (const d of docs) changed = mergeRow(fromDoc(d)) || changed;
+        if (docs.length) {
+          const last = docs[docs.length - 1];
+          cursor = last.fields.syncedAt.timestampValue;
+          after = { ts: cursor, name: last.name };
+        }
+        if (docs.length < 500) break;
       }
       store.cursor = cursor;
       store.lastSyncedAt = Date.now();
@@ -653,7 +711,7 @@ function renderAccount() {
 
   if (mode === 'off') {
     el.innerHTML = `<p class="muted">Sync isn’t set up yet, so quizzes are saved on this device only.</p>
-      <p class="muted" style="margin-top:10px">To sync your phone and computer, add your Supabase URL and key to <code>config.js</code>. The steps are in <code>SETUP.md</code>.</p>`;
+      <p class="muted" style="margin-top:10px">To sync your phone and computer, add your Firebase API key and project ID to <code>config.js</code>. The steps are in <code>SETUP.md</code>.</p>`;
     return;
   }
   if (mode === 'form') {
@@ -671,10 +729,7 @@ function renderAccount() {
       msg.className = ''; msg.textContent = '';
       form.querySelectorAll('button').forEach(b => { b.disabled = true; });
       try {
-        if (!(await signIn(email.trim(), password, create))) {
-          msg.className = 'note';
-          msg.textContent = 'Account created. Open the confirmation email, then sign in here.';
-        }
+        await signIn(email.trim(), password, create);
       } catch (err) {
         msg.className = 'err';
         msg.textContent = err.status ? err.message : 'Can’t reach the server. Are you online?';
