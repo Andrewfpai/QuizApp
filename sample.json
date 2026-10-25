@@ -1,0 +1,33 @@
+{
+  "title": "Sample: Cell Biology Basics",
+  "questions": [
+    {
+      "question": "Which organelle produces most of the cell's ATP?",
+      "options": ["Nucleus", "Mitochondria", "Ribosome", "Golgi apparatus"],
+      "answer": "B",
+      "explanation": "Mitochondria run cellular respiration, which makes most of the cell's ATP."
+    },
+    {
+      "question": "Where are proteins made in the cell?",
+      "options": ["Ribosomes", "Lysosomes", "Vacuoles", "Cell membrane"],
+      "answer": "A",
+      "explanation": "Ribosomes read mRNA and join amino acids into proteins."
+    },
+    {
+      "question": "Plant cells have a cell wall, but animal cells do not.",
+      "answer": true,
+      "explanation": "Plant cells have a cellulose cell wall outside the membrane; animal cells only have the membrane."
+    },
+    {
+      "question": "What molecule carries genetic information in almost all living things?",
+      "answer": ["DNA", "deoxyribonucleic acid"],
+      "explanation": "DNA stores the instructions for building and running the organism."
+    },
+    {
+      "question": "Which structure controls what enters and leaves the cell?",
+      "options": ["Cytoplasm", "Nucleolus", "Cell membrane", "Centriole"],
+      "answer": "Cell membrane",
+      "explanation": "The cell membrane is selectively permeable: it lets some substances through and blocks others."
+    }
+  ]
+}

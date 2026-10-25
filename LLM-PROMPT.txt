@@ -1,0 +1,39 @@
+Create a practice quiz for my quiz app.
+
+Topic: [TOPIC]
+Number of questions: [NUMBER]
+Difficulty: [easy / medium / hard]
+Source material (optional): [paste notes here, or delete this line]
+
+Reply with a single ```json code block containing ONLY valid JSON (no comments, no trailing commas), in exactly this structure:
+
+{
+  "title": "Short quiz title",
+  "questions": [
+    {
+      "question": "A multiple-choice question?",
+      "options": ["First option", "Second option", "Third option", "Fourth option"],
+      "answer": "B",
+      "explanation": "Why the correct answer is right, in 1-2 sentences."
+    },
+    {
+      "question": "A true or false statement.",
+      "answer": true,
+      "explanation": "Why it is true or false."
+    },
+    {
+      "question": "A question I answer by typing a short word or phrase?",
+      "answer": ["main answer", "another accepted spelling"],
+      "explanation": "Short explanation."
+    }
+  ]
+}
+
+Rules:
+1. Multiple choice: 2-6 "options"; "answer" is the LETTER of the correct option (A = first, B = second, ...). Spread the correct letter across A-D.
+2. Never start an option with a label such as "A)" or "1.".
+3. True/false: leave out "options"; "answer" is the boolean true or false (no quotes).
+4. Typed answer: leave out "options"; "answer" is a list of short accepted answers (1-3 words each).
+5. Every question has an "explanation".
+6. Use mostly multiple choice unless I ask for something else.
+7. Escape double quotes inside text as \".
